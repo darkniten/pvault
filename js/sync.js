@@ -127,9 +127,53 @@
     schedule(100);
   }
 
-  function validRecord(record) {
-    return record && ['prompt','folder'].includes(record.kind) && V.ids.test(record.id) && Number.isSafeInteger(record.rev) && record.rev > 0 &&
-      V.ids.test(record.opId) && V.validData(record.kind,record.data,true);
+  function readRecord(record,legacy) {
+    if (!record || !['prompt','folder'].includes(record.kind) || typeof record.id !== 'string' ||
+        typeof record.opId !== 'string' || !V.ids.test(record.id) || !V.ids.test(record.opId) ||
+        !Number.isSafeInteger(record.rev) || record.rev < 1) return null;
+    let data = record.data;
+    if (legacy && data && typeof data === 'object' && !Array.isArray(data) && data.purged !== true) {
+      // Older bridges pass objects directly through google.script.run.
+      data = record.kind === 'folder'
+        ? { ...data,deleted:data.deleted ?? null,parentId:data.parentId ?? null }
+        : { ...data,deleted:data.deleted ?? null,folderId:data.folderId ?? null,tags:data.tags ?? [] };
+    }
+    return V.validData(record.kind,data,true) ? { ...record,data } : null;
+  }
+
+  function readPage(page,since,minimumRevision) {
+    const legacy = page.wire !== 'json';
+    const rawEvents = legacy && page.events == null && page.cursor === since ? [] : page.events;
+    const more = legacy && page.more === undefined ? false : page.more;
+    if (!Array.isArray(rawEvents)) throw new Error('Відповідь Apps Script не містить списку змін.');
+    if (!Number.isSafeInteger(page.cursor) || page.cursor !== since+rawEvents.length || typeof more !== 'boolean' ||
+        (more && !rawEvents.length) || (!more && page.cursor < minimumRevision)) {
+      throw new Error('Сервер повернув неповну послідовність ревізій після '+since+'.');
+    }
+    const events = Array.from(rawEvents,(event,index) => {
+      const expected = since+index+1;
+      const record = readRecord(event,legacy);
+      if (!record || record.rev !== expected) throw new Error('Формат серверного запису в ревізії '+expected+' не відповідає архіву.');
+      return record;
+    });
+    return { events,cursor:page.cursor,more };
+  }
+
+  function readAcknowledgement(reply,operations) {
+    if (!Number.isSafeInteger(reply.revision) || !Array.isArray(reply.results) ||
+        !reply.results.length || reply.results.length > operations.length) {
+      throw new Error('Сервер повернув неповне підтвердження.');
+    }
+    return Array.from(reply.results,(result,index) => {
+      const given = operations[index];
+      const record = result?.record == null ? null : readRecord(result.record,reply.wire !== 'json');
+      if (!result || given.opId !== result.opId || given.id !== result.id || given.kind !== result.kind ||
+          !['applied','conflict'].includes(result.status) || (result.status === 'applied' && record?.opId !== given.opId) ||
+          (result.record != null && (!record || record.id !== given.id || record.kind !== given.kind || record.rev > reply.revision))) {
+        throw new Error('Сервер повернув неповне підтвердження.');
+      }
+      return { ...result,record };
+    });
   }
 
   async function run(manual = false) {
@@ -164,27 +208,16 @@
       const archiveId = hello.archiveId;
       if (!local.cloud.id) await V.store.bind(owner,archiveId);
       const operations = local.queued ? await V.store.claim(owner,manual) : [];
+      let minimumRevision = hello.revision;
       if (operations.length) {
         const incoming = await call('push',{ archiveId,operations });
-        if (!Array.isArray(incoming.results) || !incoming.results.length || incoming.results.length > operations.length ||
-          incoming.results.some((result,index) => {
-            const given = operations[index];
-            return given.opId !== result.opId || given.id !== result.id || given.kind !== result.kind ||
-              !['applied','conflict'].includes(result.status) || (result.status==='applied' && result.record?.opId!==given.opId) ||
-              (result.record ? !validRecord(result.record) || result.record.id !== given.id || result.record.kind !== given.kind :
-                result.status === 'applied');
-          })) throw new Error('Сервер повернув неповне підтвердження.');
-        await V.store.accept(owner,incoming.results);
+        await V.store.accept(owner,readAcknowledgement(incoming,operations));
+        minimumRevision = Math.max(minimumRevision,incoming.revision);
       }
       let cursor = local.cloud.cursor;
       if (operations.length || hello.revision !== cursor || !local.cloud.id || !local.cloud.at) {
         for (let i=0; i<12; i++) {
-          const page = await call('pull',{ archiveId,since:cursor });
-          if (!Number.isSafeInteger(page.cursor) || page.cursor < cursor || (page.more && page.cursor === cursor) ||
-            !Array.isArray(page.events) || page.events.some((event,index) => !validRecord(event) ||
-              event.rev <= (page.events[index-1]?.rev || cursor) || event.rev > page.cursor)) {
-            throw new Error('Сервер повернув пошкоджену сторінку архіву.');
-          }
+          const page = readPage(await call('pull',{ archiveId,since:cursor }),cursor,minimumRevision);
           await V.store.merge(owner,archiveId,page);
           cursor = page.cursor;
           remaining = page.more;

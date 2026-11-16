@@ -1,9 +1,9 @@
 const PREFIX = 'prompt-vault:' + self.registration.scope + ':';
-const CACHE = PREFIX + 'shell-v3';
+const CACHE = PREFIX + 'shell-v4';
 const FILES = [
   './', 'index.html', 'assets/vault.css?v=3', 'assets/icon.svg?v=3',
   'assets/icon-192.png?v=3', 'assets/icon-512.png?v=3', 'manifest.webmanifest?v=3',
-  'js/core.js?v=3', 'js/store.js', 'js/sync.js', 'js/app.js?v=3'
+  'js/core.js?v=3', 'js/store.js', 'js/sync.js?v=4', 'js/app.js?v=3'
 ];
 const urls = new Set(FILES.map(path => new URL(path, self.registration.scope).href));
 
